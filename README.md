@@ -89,29 +89,58 @@ This is the heart of the engine, containing the CUDA kernels and physics logic.
 
 ## 🛠 Prerequisites
 
-*   **OS**: Windows 10/11
 *   **GPU**: NVIDIA GPU with CUDA Compute Capability 7.5+ (RTX 20-series or newer recommended for full fidelity).
-*   **Compiler**: MSVC (Visual Studio) with C++17 support.
-*   **Libraries**:
-    *   **CUDA Toolkit** (11.0+)
-    *   **FreeGLUT** (for windowing)
-    *   **GLEW/OpenGL** (for rendering)
+*   **CUDA Toolkit** (11.0+) — provides `nvcc` and CUDA runtime libraries.
+*   **OpenGL** and **FreeGLUT** — for rendering and windowing.
+*   **Eigen3** — lightweight C++ header-only library for linear algebra.
 
-*Recommended*: Use `vcpkg` to install OpenGL/GLUT dependencies.
+### Windows
+*   Windows 10/11 with MSVC (Visual Studio 2019+, C++17).
+*   Use `vcpkg` for FreeGLUT and OpenGL:
+    ```powershell
+    vcpkg install freeglut:x64-windows opengl:x64-windows
+    ```
+
+### Linux (Ubuntu / Debian)
+```bash
+# Install CUDA Toolkit (includes nvcc) from NVIDIA's official repos:
+# https://developer.nvidia.com/cuda-downloads
+# Then install GL/GLUT and Eigen3:
+sudo apt-get install -y freeglut3-dev libeigen3-dev libgl1-mesa-dev
+```
 
 ---
 
 ## 🔨 Build Instructions
 
-Run the following command from the project root (ensure `nvcc` is in your PATH). 
+### CMake (Recommended — Windows & Linux)
 
-**Note**: You may need to adjust the include/lib paths to match your `vcpkg` installation location.
+```bash
+mkdir build && cd build
+cmake .. -DCUDA_ARCH=75   # set to your GPU's compute capability
+cmake --build . --config Release
+```
+
+The resulting executable is `defense` (Linux) or `defense.exe` (Windows).
+
+### Manual nvcc — Windows
+
+Run from the project root (ensure `nvcc` is in your PATH):
 
 ```powershell
 nvcc main.cu -o defense -std=c++17 ^
     -I"C:\path\to\vcpkg\installed\x64-windows\include" ^
     -Xlinker /LIBPATH:"C:\path\to\vcpkg\installed\x64-windows\lib" ^
     freeglut.lib opengl32.lib glu32.lib ^
+    -O3 -arch=sm_75
+```
+
+### Manual nvcc — Linux
+
+```bash
+nvcc main.cu -o defense -std=c++17 \
+    -I/usr/include/eigen3 \
+    -lGL -lGLU -lglut \
     -O3 -arch=sm_75
 ```
 

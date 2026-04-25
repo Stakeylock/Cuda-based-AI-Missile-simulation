@@ -1,15 +1,19 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  define NOMINMAX
+#  include <windows.h>
+#  include <direct.h>
+#endif
+
 #include <GL/glut.h>
 #include <algorithm>
 #include <cmath>
 #include <cuda_gl_interop.h>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
-#include <direct.h>
 #include <filesystem>
 #include <math.h>
 #include <stdio.h>
@@ -18,7 +22,15 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <vector>
-#include <windows.h>
+
+// Eigen3 linear algebra library (optional, used for advanced computations)
+#ifdef EIGEN_AVAILABLE
+#  include <Eigen/Dense>
+#endif
+
+#ifndef _WIN32
+#  include <unistd.h>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
