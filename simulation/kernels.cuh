@@ -287,8 +287,7 @@ __global__ void updateMissilesKernel(Missile *missiles, int count, float dt,
   physxSimulateSubsteps(&m, targetDir, thrustMag, dt);
   
   // Accumulate PhysX metrics
-  float speed = length(m.velocity);
-  atomicAdd((int*)&metrics->avgMachNumber, __float_as_int(m.machNumber));
+  atomicAdd(&metrics->avgMachNumber, m.machNumber);
   if (m.machNumber > metrics->maxMachNumber) {
       metrics->maxMachNumber = m.machNumber;
   }
@@ -314,8 +313,8 @@ __global__ void updateMissilesKernel(Missile *missiles, int count, float dt,
         float penalty = computeMissReward(&m, d_DEFENSE_STATION, rewardBreakdown, &shouldCalculate);
         
         if (shouldCalculate) {
-            atomicAdd((int*)&metrics->episodeReward, __float_as_int(penalty));
-            atomicAdd((int*)&metrics->totalPenalties, __float_as_int(-penalty));
+            atomicAdd(&metrics->episodeReward, penalty);
+            atomicAdd(&metrics->totalPenalties, -penalty);
         }
       }
     }
@@ -343,7 +342,7 @@ __global__ void updateMissilesKernel(Missile *missiles, int count, float dt,
         // Calculate prediction error
         float3 predError = collisionPoint - m.predictedImpact;
         m.predictionError = length(predError);
-        atomicAdd((int*)&metrics->avgPredictionError, __float_as_int(m.predictionError));
+        atomicAdd(&metrics->avgPredictionError, m.predictionError);
 
         // Calculate reward only if target was inside radar
         float rewardBreakdown[8];
@@ -353,11 +352,11 @@ __global__ void updateMissilesKernel(Missile *missiles, int count, float dt,
         
         if (shouldCalculate) {
             atomicAdd(&metrics->interceptSuccess, 1);
-            atomicAdd((int*)&metrics->episodeReward, __float_as_int(reward));
-            atomicAdd((int*)&metrics->totalInterceptReward, __float_as_int(rewardBreakdown[0]));
-            atomicAdd((int*)&metrics->totalSpeedBonus, __float_as_int(rewardBreakdown[1]));
-            atomicAdd((int*)&metrics->totalPredictionBonus, __float_as_int(rewardBreakdown[3]));
-            atomicAdd((unsigned int*)&metrics->avgResponseTime, __float_as_uint(m.lifetime));
+            atomicAdd(&metrics->episodeReward, reward);
+            atomicAdd(&metrics->totalInterceptReward, rewardBreakdown[0]);
+            atomicAdd(&metrics->totalSpeedBonus, rewardBreakdown[1]);
+            atomicAdd(&metrics->totalPredictionBonus, rewardBreakdown[3]);
+            atomicAdd(&metrics->avgResponseTime, m.lifetime);
         }
       }
     }
