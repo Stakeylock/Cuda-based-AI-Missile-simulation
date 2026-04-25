@@ -13,6 +13,9 @@
 // ============================================================================
 // ATMOSPHERIC MODEL (ISA - International Standard Atmosphere)
 // ============================================================================
+#ifndef ATMOSPHERE_FUNCS_DEFINED
+#define ATMOSPHERE_FUNCS_DEFINED 1
+
 __host__ __device__ inline float getAirDensity(float altitude) {
     // ISA model for air density vs altitude
     if (altitude < 0.0f) altitude = 0.0f;
@@ -40,6 +43,8 @@ __host__ __device__ inline float getSpeedOfSound(float altitude) {
     // For air: gamma = 1.4, R = 8.314, M = 0.029
     return sqrtf(1.4f * 8.314f * temp / 0.029f);
 }
+
+#endif // ATMOSPHERE_FUNCS_DEFINED
 
 __host__ __device__ inline float getMachNumber(float speed, float altitude) {
     float soundSpeed = getSpeedOfSound(altitude);
@@ -120,21 +125,25 @@ __device__ inline void physxComputeForces(
     m->force = make_float3(0.0f, 0.0f, 0.0f);
     m->torque = make_float3(0.0f, 0.0f, 0.0f);
     
-    // 1. GRAVITY
+    // 1. GRAVITY - Always applied
     float3 gravity = make_float3(0.0f, -GRAVITY * m->mass, 0.0f);
     m->force = m->force + gravity;
     
-    // 2. THRUST (if fuel available)
-    if (m->fuel > 0.0f && thrustMag > 0.0f) {
+    // 2. THRUST (only for interceptors with fuel)
+    if (m->fuel > 0.0f && thrustMag > 0.0f && m->type == INTERCEPTOR_MISSILE) {
         float3 thrustDir = normalize(m->velocity);
         if (length(m->velocity) < 1.0f) {
             thrustDir = targetDir;
         }
         
         // Apply steering towards target
-        float3 steerDir = normalize(targetDir - thrustDir);
-        float steerAmount = fminf(MAX_TURN_RATE * dt, 1.0f);
-        thrustDir = normalize(thrustDir + steerDir * steerAmount);
+        float3 steerDir = targetDir - thrustDir;
+        float steerMag = length(steerDir);
+        if (steerMag > 0.01f) {
+            steerDir = steerDir / steerMag;
+            float steerAmount = fminf(MAX_TURN_RATE * dt, 1.0f);
+            thrustDir = normalize(thrustDir + steerDir * steerAmount);
+        }
         
         float3 thrust = thrustDir * thrustMag;
         m->force = m->force + thrust;
@@ -142,13 +151,13 @@ __device__ inline void physxComputeForces(
         // Update average thrust
         m->averageThrust = (m->averageThrust * m->lifetime + thrustMag * dt) / (m->lifetime + dt);
         
-        // Fuel consumption based on thrust
-        float fuelRate = (m->type == INTERCEPTOR_MISSILE) ? 3.0f : 2.0f;
+        // Fuel consumption
+        float fuelRate = 3.0f;  // Interceptor fuel rate
         m->fuel -= fuelRate * dt;
         m->fuelConsumed += fuelRate * dt;
     }
     
-    // 3. AERODYNAMIC DRAG
+    // 3. AERODYNAMIC DRAG - Always applied
     if (speed > 0.1f) {
         float CD = getDragCoefficient(m->machNumber, m->dragCoefficient);
         float dragMag = m->dynamicPressure * CD * m->referenceArea;
@@ -157,27 +166,34 @@ __device__ inline void physxComputeForces(
         m->force = m->force + drag;
     }
     
-    // 4. LIFT (for maneuvering)
-    if (speed > 10.0f) {
+    // 4. LIFT (ONLY for interceptors during active maneuvering)
+    // Enemy missiles are ballistic - no lift/steering
+    if (m->type == INTERCEPTOR_MISSILE && speed > 10.0f && thrustMag > 0.0f) {
         // Calculate angle of attack
         float3 velDir = normalize(m->velocity);
         float3 bodyAxis = normalize(targetDir);
         float dotProd = fminf(fmaxf(dot(velDir, bodyAxis), -1.0f), 1.0f);
         float angleOfAttack = acosf(dotProd);
         
+        // Limit angle of attack for stability
+        if (angleOfAttack > MAX_AOA_RAD) {
+            angleOfAttack = MAX_AOA_RAD;
+        }
+        
         float CL = getLiftCoefficient(angleOfAttack, m->machNumber);
         float liftMag = m->dynamicPressure * CL * m->referenceArea;
         
-        // Lift perpendicular to velocity
-        float3 liftDir = normalize(bodyAxis - velDir * dot(bodyAxis, velDir));
-        if (length(liftDir) < 0.001f) {
-            liftDir = make_float3(0.0f, 1.0f, 0.0f);
+        // Lift perpendicular to velocity, toward target direction
+        float3 liftDir = bodyAxis - velDir * dot(bodyAxis, velDir);
+        float liftDirMag = length(liftDir);
+        if (liftDirMag > 0.001f) {
+            liftDir = liftDir / liftDirMag;
+            float3 lift = liftDir * liftMag;
+            m->force = m->force + lift;
         }
-        float3 lift = liftDir * liftMag;
-        m->force = m->force + lift;
     }
     
-    // 5. MAGNUS EFFECT (spin stabilization)
+    // 5. MAGNUS EFFECT (spin stabilization) - small effect
     if (speed > 10.0f && length(m->angularVelocity) > 0.01f) {
         float3 magnusDir = normalize(cross(m->angularVelocity, m->velocity));
         float magnusMag = MAGNUS_COEFFICIENT * m->airDensity * speed * 

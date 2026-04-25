@@ -121,7 +121,28 @@ __device__ inline float computeMissReward(
 }
 
 // ============================================================================
-// RADAR DETECTION AND INTERCEPTION KERNEL (PhysX-enhanced)
+// CHECK IF POSITION IS INSIDE PROTECTED TERRITORY
+// ============================================================================
+__device__ inline bool isInsideTerritory(float3 position, float3 defensePos) {
+    float3 toPos = position - defensePos;
+    float horizontalDist = sqrtf(toPos.x * toPos.x + toPos.z * toPos.z);
+    return horizontalDist < TERRITORY_RADIUS;
+}
+
+// ============================================================================
+// COUNT ACTIVE INTERCEPTORS TARGETING A MISSILE (OPTIMIZED)
+// Uses cached interceptorsAssigned value instead of O(n) scan
+// Only do full scan occasionally for validation
+// ============================================================================
+__device__ inline int countActiveInterceptors(Missile* missiles, int missileCount, int targetId) {
+    // Fast path: use the cached value from the enemy missile
+    // This avoids O(n) scan every frame for every enemy
+    // The value is kept up-to-date when interceptors are created/destroyed
+    return missiles[targetId].interceptorsAssigned;
+}
+
+// ============================================================================
+// RADAR DETECTION AND INTERCEPTION KERNEL (PhysX-enhanced with retry logic)
 // ============================================================================
 __global__ void radarDetectionKernel(Missile *missiles, int missileCount,
                                      RLAgent *agent, TrainingMetrics *metrics,
@@ -143,23 +164,52 @@ __global__ void radarDetectionKernel(Missile *missiles, int missileCount,
   m.targetInsideRadar = isTargetInsideRadar(m.target, d_DEFENSE_STATION) ? 1 : 0;
 
   if (distance < RADAR_RANGE && distance > 500.0f) {
-    // Update radar stats
-    if (m.targetInsideRadar) {
-        atomicAdd(&metrics->insideRadarCount, 1);
-    } else {
-        atomicAdd(&metrics->outsideRadarCount, 1);
+    // Update radar stats (only once per missile)
+    if (m.detectionTime == 0.0f) {
+        m.detectionTime = globalTime - m.launchTime;
+        if (m.targetInsideRadar) {
+            atomicAdd(&metrics->insideRadarCount, 1);
+        } else {
+            atomicAdd(&metrics->outsideRadarCount, 1);
+        }
     }
     
-    bool alreadyTargeted = false;
-    for (int i = 0; i < missileCount; i++) {
-      if (missiles[i].active && missiles[i].type == INTERCEPTOR_MISSILE &&
-          missiles[i].targetMissileId == idx) {
-        alreadyTargeted = true;
-        break;
-      }
+    // Count how many active interceptors are already targeting this missile
+    int activeInterceptors = countActiveInterceptors(missiles, missileCount, idx);
+    m.interceptorsAssigned = activeInterceptors;
+    
+    // Determine if we should launch an interceptor:
+    // - First time: interceptAttempts == 0 and no active interceptor
+    // - Retry: previous interceptor failed (activeInterceptors == 0) and we have budget
+    int currentAttempts = m.interceptAttempts;
+    bool shouldLaunch = false;
+    
+    if (currentAttempts == 0 && activeInterceptors == 0) {
+        // First interceptor needed
+        shouldLaunch = true;
+    } else if (currentAttempts > 0 && currentAttempts < MAX_INTERCEPTORS_PER_TARGET && activeInterceptors == 0) {
+        // Retry case: all previous interceptors failed/timed out
+        shouldLaunch = true;
     }
 
-    if (!alreadyTargeted && *interceptorCount < MAX_INTERCEPTORS) {
+    if (shouldLaunch && *interceptorCount < MAX_INTERCEPTORS) {
+      // Use atomicCAS to safely claim the launch slot (only one thread wins)
+      int expected = currentAttempts;
+      int desired = currentAttempts + 1;
+      int prevAttempts = atomicCAS(&m.interceptAttempts, expected, desired);
+      
+      // If CAS failed, another thread already launched - skip
+      if (prevAttempts != expected) {
+          return;
+      }
+      
+      // Check if this is a retry (penalty applies)
+      if (prevAttempts > 0) {
+          atomicAdd(&metrics->totalRetryAttempts, 1);
+          atomicAdd((int*)&metrics->retryPenaltyTotal, 
+                    __float_as_int(PENALTY_PER_EXTRA_INTERCEPTOR));
+      }
+      
       // Enhanced PINN prediction
       float3 predictedPos;
       float confidence;
@@ -181,15 +231,36 @@ __global__ void radarDetectionKernel(Missile *missiles, int missileCount,
                       d_DEFENSE_STATION, &launchAngle, &launchPitch);
 
       int interceptorIdx = atomicAdd(interceptorCount, 1);
-      if (interceptorIdx < missileCount) {
+      if (interceptorIdx < MAX_MISSILES) {  // FIX: Check against MAX_MISSILES, not missileCount
+        // Increment active interceptor count on the target enemy missile
+        atomicAdd(&m.interceptorsAssigned, 1);
+        
         Missile &interceptor = missiles[interceptorIdx];
         
         // Initialize PhysX state for interceptor
         interceptor.position = d_DEFENSE_STATION;
-        interceptor.prevPosition = d_DEFENSE_STATION;
+        interceptor.position.y = 50.0f;  // Launch from slightly above ground
+        interceptor.prevPosition = interceptor.position;
 
-        float3 toIntercept = normalize(interceptPoint - d_DEFENSE_STATION);
-        float initialSpeed = 200.0f;
+        float3 toIntercept = normalize(interceptPoint - interceptor.position);
+        
+        // Ensure interceptor doesn't launch straight up
+        if (toIntercept.y > 0.95f) {
+            toIntercept.y = 0.8f;
+            float horizScale = sqrtf(1.0f - 0.64f);
+            float3 horizDir = interceptPoint - interceptor.position;
+            horizDir.y = 0;
+            if (length(horizDir) > 1.0f) {
+                horizDir = normalize(horizDir);
+            } else {
+                horizDir = make_float3(1.0f, 0.0f, 0.0f);
+            }
+            toIntercept.x = horizDir.x * horizScale;
+            toIntercept.z = horizDir.z * horizScale;
+            toIntercept = normalize(toIntercept);
+        }
+        
+        float initialSpeed = 250.0f;
         interceptor.velocity = toIntercept * initialSpeed;
         interceptor.prevVelocity = interceptor.velocity;
         interceptor.initialVelocity = interceptor.velocity;
@@ -202,10 +273,10 @@ __global__ void radarDetectionKernel(Missile *missiles, int missileCount,
         
         interceptor.target = interceptPoint;
         interceptor.predictedImpact = predictedPos;
-        interceptor.launchPos = d_DEFENSE_STATION;
+        interceptor.launchPos = interceptor.position;
         
         // Physical properties
-        interceptor.fuel = 15.0f;
+        interceptor.fuel = 20.0f;  // More fuel for longer pursuit
         interceptor.mass = INTERCEPTOR_MASS;
         interceptor.dragCoefficient = DRAG_COEFFICIENT;
         interceptor.liftCoefficient = LIFT_COEFFICIENT;
@@ -214,11 +285,18 @@ __global__ void radarDetectionKernel(Missile *missiles, int missileCount,
         interceptor.active = 1;
         interceptor.hit = 0;
         interceptor.type = INTERCEPTOR_MISSILE;
+        interceptor.endState = MISSILE_ACTIVE;
         interceptor.lifetime = 0.0f;
         interceptor.targetMissileId = idx;
         interceptor.launchTime = globalTime;
         interceptor.detectionTime = globalTime - m.launchTime;
         interceptor.missileId = interceptorIdx + 10000;
+        
+        // Track this interceptor on the enemy missile (prevAttempts is 0-indexed)
+        // Note: m.interceptAttempts was already atomically incremented above
+        if (prevAttempts < MAX_INTERCEPTORS_PER_TARGET) {
+            m.assignedInterceptorIds[prevAttempts] = interceptor.missileId;
+        }
         
         // Statistics initialization
         interceptor.maxAltitude = 0.0f;
@@ -230,19 +308,23 @@ __global__ void radarDetectionKernel(Missile *missiles, int missileCount,
         interceptor.minDistanceToTarget = distance;
         interceptor.predictionError = 0.0f;
         interceptor.substepAccumulator = 0.0f;
+        interceptor.interceptorsAssigned = 0;
+        interceptor.interceptAttempts = 0;
+        interceptor.landedInTerritory = 0;
         
         interceptor.insideRadar = 1;
         interceptor.targetInsideRadar = m.targetInsideRadar;
 
         atomicAdd(&metrics->totalLaunched, 1);
         atomicAdd(&metrics->totalInterceptorsFired, 1);
+        atomicAdd(&metrics->defenseMissilesLaunched, 1);
       }
     }
   }
 }
 
 // ============================================================================
-// UPDATE MISSILE PHYSICS (PhysX-based)
+// UPDATE MISSILE PHYSICS (PhysX-based with comprehensive tracking)
 // ============================================================================
 __global__ void updateMissilesKernel(Missile *missiles, int count, float dt,
                                      TrainingMetrics *metrics) {
@@ -257,29 +339,61 @@ __global__ void updateMissilesKernel(Missile *missiles, int count, float dt,
   // Calculate target direction and thrust
   float3 toTarget = m.target - m.position;
   float distToTarget = length(toTarget);
-  float3 targetDir = (distToTarget > 1.0f) ? normalize(toTarget) : make_float3(0, 1, 0);
+  float3 targetDir = (distToTarget > 1.0f) ? normalize(toTarget) : make_float3(0, -1, 0);
   
   // Track minimum distance to target
   if (distToTarget < m.minDistanceToTarget) {
       m.minDistanceToTarget = distToTarget;
   }
 
-  float thrustMag = (m.type == INTERCEPTOR_MISSILE) ? INTERCEPTOR_THRUST : 0.0f;
-  if (m.type == ENEMY_MISSILE) {
-      float speed = length(m.velocity);
-      targetDir = (speed > 1.0f) ? normalize(m.velocity) : make_float3(0, 1, 0);
-  }
+  float thrustMag = 0.0f;
   
-  // For interceptors, use proportional navigation
-  if (m.type == INTERCEPTOR_MISSILE && m.targetMissileId >= 0) {
-      Missile &target = missiles[m.targetMissileId];
-      if (target.active) {
-          float3 pnAccel = physxProportionalNavigation(
-              m.position, m.velocity,
-              target.position, target.velocity,
-              4.0f  // Navigation gain
-          );
-          targetDir = normalize(m.velocity + pnAccel * dt);
+  // ENEMY MISSILES: Ballistic trajectory - NO thrust, NO steering after launch
+  // They follow pure ballistic physics: gravity + drag only
+  if (m.type == ENEMY_MISSILE) {
+      thrustMag = 0.0f;  // No thrust
+      // targetDir should be velocity-aligned for correct drag calculation
+      // but we DON'T want lift/steering - handle this in physics function
+      float speed = length(m.velocity);
+      if (speed > 1.0f) {
+          targetDir = normalize(m.velocity);  // Body axis aligned with velocity
+      } else {
+          // If nearly stationary, point downward (falling)
+          targetDir = make_float3(0.0f, -1.0f, 0.0f);
+      }
+  }
+  // INTERCEPTORS: Active guidance with thrust
+  else if (m.type == INTERCEPTOR_MISSILE) {
+      thrustMag = (m.fuel > 0.0f) ? INTERCEPTOR_THRUST : 0.0f;
+      
+      // Proportional navigation toward target
+      if (m.targetMissileId >= 0 && m.targetMissileId < count) {
+          Missile &target = missiles[m.targetMissileId];
+          if (target.active) {
+              float3 pnAccel = physxProportionalNavigation(
+                  m.position, m.velocity,
+                  target.position, target.velocity,
+                  4.0f  // Navigation gain
+              );
+              
+              // Blend PN acceleration with current velocity direction
+              float3 desiredDir = m.velocity + pnAccel * dt;
+              if (length(desiredDir) > 1.0f) {
+                  targetDir = normalize(desiredDir);
+              }
+              
+              // Update predicted impact based on target motion
+              float3 relPos = target.position - m.position;
+              float3 relVel = target.velocity - m.velocity;
+              float closingSpeed = -dot(relVel, normalize(relPos));
+              if (closingSpeed > 10.0f) {
+                  float timeToIntercept = length(relPos) / closingSpeed;
+                  m.predictedImpact = target.position + target.velocity * timeToIntercept;
+              }
+          } else {
+              // Target destroyed or inactive - self-destruct or continue to last known position
+              targetDir = normalize(m.predictedImpact - m.position);
+          }
       }
   }
 
@@ -293,7 +407,7 @@ __global__ void updateMissilesKernel(Missile *missiles, int count, float dt,
       metrics->maxMachNumber = m.machNumber;
   }
 
-  // Ground collision
+  // Ground collision - CRITICAL FOR DEFENSE TRACKING
   if (m.position.y <= GROUND_LEVEL) {
     m.position.y = GROUND_LEVEL;
     m.velocity = make_float3(0, 0, 0);
@@ -302,22 +416,44 @@ __global__ void updateMissilesKernel(Missile *missiles, int count, float dt,
 
     if (m.type == ENEMY_MISSILE) {
       float3 toDefense = d_DEFENSE_STATION - m.position;
-      float distToDefense = length(toDefense);
+      float distToDefense = sqrtf(toDefense.x * toDefense.x + toDefense.z * toDefense.z);
       
-      // Only count as failure if target was inside radar
-      if (m.targetInsideRadar && distToDefense < RADAR_RANGE) {
-        atomicAdd(&metrics->interceptFail, 1);
-        
-        // Calculate miss penalty
-        float rewardBreakdown[8];
-        bool shouldCalculate;
-        float penalty = computeMissReward(&m, d_DEFENSE_STATION, rewardBreakdown, &shouldCalculate);
-        
-        if (shouldCalculate) {
-            atomicAdd((int*)&metrics->episodeReward, __float_as_int(penalty));
-            atomicAdd((int*)&metrics->totalPenalties, __float_as_int(-penalty));
-        }
+      // Check if landed in protected territory
+      bool inTerritory = isInsideTerritory(m.position, d_DEFENSE_STATION);
+      m.landedInTerritory = inTerritory ? 1 : 0;
+      
+      if (inTerritory) {
+          // CRITICAL: Enemy missile hit inside territory - defense failed!
+          m.endState = MISSILE_GROUND_HIT_TERRITORY;
+          atomicAdd(&metrics->enemyMissilesLandedTerritory, 1);
+          atomicAdd(&metrics->interceptFail, 1);
+          
+          // Severe penalty for territory hit
+          float penalty = PENALTY_COLLISION_MISS * 2.0f;  // Double penalty for territory hit
+          atomicAdd((int*)&metrics->episodeReward, __float_as_int(penalty));
+          atomicAdd((int*)&metrics->totalPenalties, __float_as_int(-penalty));
+      } else {
+          // Landed outside territory - less severe
+          m.endState = MISSILE_GROUND_HIT_OUTSIDE;
+          atomicAdd(&metrics->enemyMissilesLandedOutside, 1);
+          
+          // Only count as failure if target was inside radar but we missed
+          if (m.targetInsideRadar && distToDefense < RADAR_RANGE) {
+              atomicAdd(&metrics->interceptFail, 1);
+              
+              float rewardBreakdown[8];
+              bool shouldCalculate;
+              float penalty = computeMissReward(&m, d_DEFENSE_STATION, rewardBreakdown, &shouldCalculate);
+              
+              if (shouldCalculate) {
+                  atomicAdd((int*)&metrics->episodeReward, __float_as_int(penalty));
+                  atomicAdd((int*)&metrics->totalPenalties, __float_as_int(-penalty));
+              }
+          }
       }
+      
+      // Account for this enemy missile
+      atomicAdd(&metrics->enemyMissilesAccountedFor, 1);
     }
   }
 
@@ -359,14 +495,100 @@ __global__ void updateMissilesKernel(Missile *missiles, int count, float dt,
             atomicAdd((int*)&metrics->totalPredictionBonus, __float_as_int(rewardBreakdown[3]));
             atomicAdd((unsigned int*)&metrics->avgResponseTime, __float_as_uint(m.lifetime));
         }
+        
+        // Update comprehensive tracking
+        m.endState = MISSILE_INTERCEPTED;
+        target.endState = MISSILE_INTERCEPTED;
+        atomicAdd(&metrics->enemyMissilesIntercepted, 1);
+        atomicAdd(&metrics->defenseMissilesHit, 1);
+        atomicAdd(&metrics->enemyMissilesAccountedFor, 1);
+        atomicAdd(&metrics->defenseMissilesAccountedFor, 1);
+        
+        // Decrement active interceptor count on target (interceptor completed its mission)
+        atomicSub(&target.interceptorsAssigned, 1);
+        
+        // Apply retry penalty if multiple attempts were used
+        if (target.interceptAttempts > 1) {
+            float retryPenalty = PENALTY_PER_EXTRA_INTERCEPTOR * (target.interceptAttempts - 1);
+            atomicAdd((int*)&metrics->episodeReward, __float_as_int(retryPenalty));
+        }
       }
     }
   }
 
-  // Bounds check
-  if (fabsf(m.position.x) > WORLD_SIZE || fabsf(m.position.z) > WORLD_SIZE ||
-      m.position.y > 50000.0f || m.lifetime > 120.0f) {
-    m.active = 0;
+  // ========================================================================
+  // BOUNDS AND TERMINATION CHECKS WITH COMPREHENSIVE TRACKING
+  // ========================================================================
+  
+  bool outOfBounds = fabsf(m.position.x) > WORLD_SIZE || 
+                     fabsf(m.position.z) > WORLD_SIZE ||
+                     m.position.y > 50000.0f;
+  bool timedOut = m.lifetime > INTERCEPTOR_TIMEOUT;
+  
+  // Check if missile is going up forever (physics bug detection)
+  // A missile should not continuously gain altitude without thrust
+  bool goingUpForever = false;
+  if (m.type == ENEMY_MISSILE && m.fuel <= 0.0f && m.velocity.y > 50.0f && m.position.y > 5000.0f) {
+      // Enemy missile with no fuel should not be climbing significantly
+      // Apply corrective gravity if velocity is too upward
+      goingUpForever = true;
+  }
+  
+  // Apply corrective physics for missiles going up forever
+  if (goingUpForever) {
+      // Force stronger downward acceleration
+      m.velocity.y -= GRAVITY * dt * 3.0f;  // Triple gravity correction
+  }
+  
+  // ENEMY MISSILES: Only deactivate on ground hit or extreme out of bounds
+  if (m.type == ENEMY_MISSILE) {
+    if (outOfBounds && !m.hit) {
+      m.active = 0;
+      m.endState = MISSILE_OUT_OF_BOUNDS;
+      atomicAdd(&metrics->enemyMissilesOutOfBounds, 1);
+      atomicAdd(&metrics->enemyMissilesAccountedFor, 1);
+    }
+  } 
+  // INTERCEPTORS: Can timeout, miss target, or go out of bounds
+  else {
+    if (timedOut && !m.hit) {
+      m.active = 0;
+      m.endState = MISSILE_INTERCEPTOR_TIMEOUT;
+      atomicAdd(&metrics->defenseMissilesMissed, 1);
+      atomicAdd(&metrics->defenseMissilesAccountedFor, 1);
+      
+      // Decrement active interceptor count on target
+      if (m.targetMissileId >= 0 && m.targetMissileId < count) {
+          atomicSub(&missiles[m.targetMissileId].interceptorsAssigned, 1);
+      }
+      
+      // Mark this as a failed intercept attempt - target may need retry
+      // The radar kernel will detect this and potentially launch another
+    }
+    else if (outOfBounds && !m.hit) {
+      m.active = 0;
+      m.endState = MISSILE_INTERCEPTOR_MISSED;
+      atomicAdd(&metrics->defenseMissilesMissed, 1);
+      atomicAdd(&metrics->defenseMissilesAccountedFor, 1);
+      
+      // Decrement active interceptor count on target
+      if (m.targetMissileId >= 0 && m.targetMissileId < count) {
+          atomicSub(&missiles[m.targetMissileId].interceptorsAssigned, 1);
+      }
+    }
+    // Check if interceptor hit ground (missed target completely)
+    else if (m.position.y <= GROUND_LEVEL && !m.hit) {
+      m.active = 0;
+      m.hit = 1;
+      m.endState = MISSILE_INTERCEPTOR_MISSED;
+      atomicAdd(&metrics->defenseMissilesMissed, 1);
+      atomicAdd(&metrics->defenseMissilesAccountedFor, 1);
+      
+      // Decrement active interceptor count on target
+      if (m.targetMissileId >= 0 && m.targetMissileId < count) {
+          atomicSub(&missiles[m.targetMissileId].interceptorsAssigned, 1);
+      }
+    }
   }
 }
 

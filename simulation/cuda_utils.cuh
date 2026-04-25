@@ -22,7 +22,15 @@ __host__ __device__ inline float3 operator-(const float3 &a, const float3 &b) {
   return make_float3(a.x - b.x, a.y - b.y, a.z - b.z);
 }
 
+__host__ __device__ inline float3 operator-(const float3 &a) {
+  return make_float3(-a.x, -a.y, -a.z);
+}
+
 __host__ __device__ inline float3 operator*(const float3 &a, float s) {
+  return make_float3(a.x * s, a.y * s, a.z * s);
+}
+
+__host__ __device__ inline float3 operator*(float s, const float3 &a) {
   return make_float3(a.x * s, a.y * s, a.z * s);
 }
 

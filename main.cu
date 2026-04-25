@@ -17,6 +17,9 @@ TrainingMetrics *d_metrics = nullptr;
 TrainingMetrics *h_metrics = nullptr;
 TrainingHistory *h_history = nullptr;
 
+// Pre-allocated GPU counter (avoid malloc/free every frame)
+int *d_interceptorCount = nullptr;
+
 std::vector<MissileEvent> missileLog;
 std::vector<EpisodeMetrics> episodeLog;
 
@@ -29,6 +32,30 @@ float simulationSpeed = 1.0f;
 int trainingEpisodes = 0;
 float globalTime = 0.0f;
 int currentEpisodeId = 0;
+
+// ============================================================================
+// COMPREHENSIVE MISSILE TRACKING (Host-side verification)
+// ============================================================================
+struct MissileAccountingHost {
+    int enemyLaunched;
+    int enemyIntercepted;
+    int enemyLandedTerritory;
+    int enemyLandedOutside;
+    int enemyOutOfBounds;
+    int enemyActive;
+    
+    int defenseLaunched;
+    int defenseHit;
+    int defenseMissed;
+    int defenseActive;
+    
+    // Verification
+    int enemyAccountedFor() { return enemyIntercepted + enemyLandedTerritory + enemyLandedOutside + enemyOutOfBounds + enemyActive; }
+    int defenseAccountedFor() { return defenseHit + defenseMissed + defenseActive; }
+    bool isBalanced() { return (enemyAccountedFor() == enemyLaunched) && (defenseAccountedFor() == defenseLaunched); }
+};
+
+MissileAccountingHost missileAccounting = {0};
 
 // Model management
 char modelName[256] = "default_model";
@@ -72,12 +99,21 @@ float targetMarkerPulse = 0.0f;
 // Includes for other modules
 #include "core/config.h"
 #include "core/globals.h"
+#include "core/rl_trainer.h"
 #include "io/file_io.h"
 #include "render/renderer.h"
 #include "simulation/cuda_utils.cuh"
 #include "simulation/physx_engine.cuh"
 #include "simulation/kernels.cuh"
+#include "simulation/defense_grade_simulation.cuh"
 #include "simulation/neural_net.cuh"
+
+// Defense-grade state global variable
+DefenseGradeState defGradeState;
+int* d_extendedIndices = nullptr;
+MissileExtended* h_extended = nullptr; // host copy for occasional sync
+RLTrainer* trainer = nullptr;
+
 
 // ============================================================================
 // HELPER: Screen to World coordinate conversion
@@ -172,6 +208,7 @@ void initSimulation() {
   CUDA_CHECK(cudaMalloc(&d_missiles, MAX_MISSILES * sizeof(Missile)));
   CUDA_CHECK(cudaMalloc(&d_agent, sizeof(RLAgent)));
   CUDA_CHECK(cudaMalloc(&d_metrics, sizeof(TrainingMetrics)));
+  CUDA_CHECK(cudaMalloc(&d_interceptorCount, sizeof(int)));  // Pre-allocate for performance
   CUDA_CHECK(
       cudaMemcpyToSymbol(d_DEFENSE_STATION, &DEFENSE_STATION, sizeof(float3)));
 
@@ -417,6 +454,15 @@ void launchEnemyMissile(float targetX, float targetZ) {
   m.minDistanceToTarget = distance;
   m.predictionError = 0.0f;
   m.substepAccumulator = 0.0f;
+  
+  // Defense retry tracking initialization
+  m.interceptorsAssigned = 0;
+  m.interceptAttempts = 0;
+  for (int i = 0; i < MAX_INTERCEPTORS_PER_TARGET; i++) {
+      m.assignedInterceptorIds[i] = -1;
+  }
+  m.endState = MISSILE_ACTIVE;
+  m.landedInTerritory = 0;
 
   h_missiles[totalMissileCount] = m;
   CUDA_CHECK(cudaMemcpy(&d_missiles[totalMissileCount], &m, sizeof(Missile),
@@ -424,6 +470,8 @@ void launchEnemyMissile(float targetX, float targetZ) {
   totalMissileCount++;
   enemyMissileCount++;
   h_metrics->totalMissilesFired++;
+  h_metrics->enemyMissilesLaunched++;
+  missileAccounting.enemyLaunched++;
 }
 
 void updateSimulation(float dt) {
@@ -434,20 +482,28 @@ void updateSimulation(float dt) {
   globalTime += dt;
   int blocks = (totalMissileCount + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-  int *d_interceptorCount;
-  CUDA_CHECK(cudaMalloc(&d_interceptorCount, sizeof(int)));
+  // CRITICAL FIX: Initialize interceptorCount to totalMissileCount
+  // so new interceptors are placed AFTER existing missiles, not overwriting them!
+  interceptorCount = totalMissileCount;
+  
+  // Use pre-allocated GPU counter (avoid malloc/free every frame for performance)
   CUDA_CHECK(cudaMemcpy(d_interceptorCount, &interceptorCount, sizeof(int),
                         cudaMemcpyHostToDevice));
 
-  radarDetectionKernel<<<blocks, BLOCK_SIZE>>>(
+  // Use larger block size for better GPU occupancy on RTX cards
+  const int RADAR_BLOCK_SIZE = 256;
+  int radarBlocks = (totalMissileCount + RADAR_BLOCK_SIZE - 1) / RADAR_BLOCK_SIZE;
+  radarDetectionKernel<<<radarBlocks, RADAR_BLOCK_SIZE>>>(
       d_missiles, totalMissileCount, d_agent, d_metrics, d_interceptorCount, dt,
       globalTime);
 
   CUDA_CHECK(cudaMemcpy(&interceptorCount, d_interceptorCount, sizeof(int),
                         cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaFree(d_interceptorCount));
 
   totalMissileCount = std::max(totalMissileCount, interceptorCount);
+
+  // CRITICAL: Recalculate blocks to include newly launched interceptors
+  blocks = (totalMissileCount + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
   updateMissilesKernel<<<blocks, BLOCK_SIZE>>>(d_missiles, totalMissileCount,
                                                dt, d_metrics);
@@ -565,6 +621,77 @@ void updateSimulation(float dt) {
         logMissileEvent(event);
       }
     }
+  }
+  
+  // ============================================================================
+  // UPDATE HOST-SIDE MISSILE ACCOUNTING
+  // ============================================================================
+  {
+      // Reset active counts
+      missileAccounting.enemyActive = 0;
+      missileAccounting.defenseActive = 0;
+      
+      // Count from GPU metrics
+      CUDA_CHECK(cudaMemcpy(h_metrics, d_metrics, sizeof(TrainingMetrics), cudaMemcpyDeviceToHost));
+      
+      // Update from metrics
+      missileAccounting.enemyIntercepted = h_metrics->enemyMissilesIntercepted;
+      missileAccounting.enemyLandedTerritory = h_metrics->enemyMissilesLandedTerritory;
+      missileAccounting.enemyLandedOutside = h_metrics->enemyMissilesLandedOutside;
+      missileAccounting.enemyOutOfBounds = h_metrics->enemyMissilesOutOfBounds;
+      missileAccounting.defenseHit = h_metrics->defenseMissilesHit;
+      missileAccounting.defenseMissed = h_metrics->defenseMissilesMissed;
+      missileAccounting.defenseLaunched = h_metrics->defenseMissilesLaunched;
+      
+      // Count active missiles from host copy
+      for (int i = 0; i < totalMissileCount; i++) {
+          if (h_missiles[i].active) {
+              if (h_missiles[i].type == ENEMY_MISSILE) {
+                  missileAccounting.enemyActive++;
+              } else {
+                  missileAccounting.defenseActive++;
+              }
+          }
+      }
+      
+      // Periodic verification and status print
+      static int printCounter = 0;
+      if (++printCounter % 500 == 0) {  // Every 500 frames
+          int enemyTotal = missileAccounting.enemyAccountedFor();
+          int defenseTotal = missileAccounting.defenseAccountedFor();
+          bool balanced = missileAccounting.isBalanced();
+          
+          printf("\n========== MISSILE ACCOUNTING STATUS ==========\n");
+          printf("ENEMY MISSILES:\n");
+          printf("  Launched:          %d\n", missileAccounting.enemyLaunched);
+          printf("  Intercepted:       %d\n", missileAccounting.enemyIntercepted);
+          printf("  Landed Territory:  %d (CRITICAL!)\n", missileAccounting.enemyLandedTerritory);
+          printf("  Landed Outside:    %d\n", missileAccounting.enemyLandedOutside);
+          printf("  Out of Bounds:     %d\n", missileAccounting.enemyOutOfBounds);
+          printf("  Active in Flight:  %d\n", missileAccounting.enemyActive);
+          printf("  TOTAL ACCOUNTED:   %d %s\n", enemyTotal, 
+                 (enemyTotal == missileAccounting.enemyLaunched) ? "[OK]" : "[MISMATCH!]");
+          
+          printf("\nDEFENSE MISSILES:\n");
+          printf("  Launched:          %d\n", missileAccounting.defenseLaunched);
+          printf("  Hit (Success):     %d\n", missileAccounting.defenseHit);
+          printf("  Missed/Timeout:    %d\n", missileAccounting.defenseMissed);
+          printf("  Active in Flight:  %d\n", missileAccounting.defenseActive);
+          printf("  TOTAL ACCOUNTED:   %d %s\n", defenseTotal,
+                 (defenseTotal == missileAccounting.defenseLaunched) ? "[OK]" : "[MISMATCH!]");
+          
+          printf("\nSCORING:\n");
+          float interceptRate = missileAccounting.enemyLaunched > 0 ? 
+              100.0f * missileAccounting.enemyIntercepted / missileAccounting.enemyLaunched : 0.0f;
+          float efficiency = missileAccounting.defenseHit > 0 ?
+              100.0f * missileAccounting.defenseHit / missileAccounting.defenseLaunched : 0.0f;
+          printf("  Intercept Rate:    %.1f%%\n", interceptRate);
+          printf("  Defense Efficiency:%.1f%%\n", efficiency);
+          printf("  Territory Hits:    %d (MUST BE 0!)\n", missileAccounting.enemyLandedTerritory);
+          printf("  Retry Attempts:    %d\n", h_metrics->totalRetryAttempts);
+          printf("  Balance Check:     %s\n", balanced ? "PASSED" : "FAILED - MISSILES MISSING!");
+          printf("================================================\n\n");
+      }
   }
 
   CUDA_CHECK(cudaGetLastError());

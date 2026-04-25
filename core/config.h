@@ -18,6 +18,8 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <vector>
+#include <Eigen/Dense>
+#include <Eigen/Core>
 #include <windows.h>
 
 #ifndef M_PI
@@ -114,6 +116,25 @@ namespace fs = std::filesystem;
 #define PENALTY_FUEL_WASTE -5.0f
 #define PENALTY_COLLISION_MISS -100.0f
 
+// Defense retry constants
+#define MAX_INTERCEPTORS_PER_TARGET 3
+#define PENALTY_PER_EXTRA_INTERCEPTOR -25.0f
+#define INTERCEPTOR_TIMEOUT 60.0f
+
+// Territory definition (protected area around defense station)
+#define TERRITORY_RADIUS 5000.0f
+
+// Missile termination states
+enum MissileEndState {
+    MISSILE_ACTIVE = 0,
+    MISSILE_INTERCEPTED = 1,
+    MISSILE_GROUND_HIT_TERRITORY = 2,
+    MISSILE_GROUND_HIT_OUTSIDE = 3,
+    MISSILE_OUT_OF_BOUNDS = 4,
+    MISSILE_INTERCEPTOR_TIMEOUT = 5,
+    MISSILE_INTERCEPTOR_MISSED = 6
+};
+
 // Missile types
 enum MissileType { ENEMY_MISSILE = 0, INTERCEPTOR_MISSILE = 1 };
 
@@ -179,6 +200,15 @@ struct Missile {
   // IDs and tracking
   int targetMissileId;
   int missileId;
+  
+  // Defense retry tracking
+  int interceptorsAssigned;      // How many interceptors targeting this
+  int interceptAttempts;         // Number of intercept attempts made
+  int assignedInterceptorIds[MAX_INTERCEPTORS_PER_TARGET];  // IDs of assigned interceptors
+  
+  // Termination state tracking
+  int endState;                  // MissileEndState enum value
+  int landedInTerritory;         // 1 if landed inside territory, 0 otherwise
   
   // Statistics
   float maxAltitude;
@@ -444,6 +474,29 @@ struct TrainingMetrics {
   int totalMissilesFired;
   int totalInterceptorsFired;
   
+  // ===== COMPREHENSIVE MISSILE ACCOUNTING =====
+  // Enemy missiles
+  int enemyMissilesLaunched;
+  int enemyMissilesIntercepted;
+  int enemyMissilesLandedTerritory;   // Hit ground inside territory (BAD)
+  int enemyMissilesLandedOutside;     // Hit ground outside territory
+  int enemyMissilesOutOfBounds;       // Went out of simulation bounds
+  int enemyMissilesActive;            // Currently in flight
+  
+  // Defense missiles
+  int defenseMissilesLaunched;
+  int defenseMissilesHit;             // Successfully intercepted
+  int defenseMissilesMissed;          // Failed to intercept (timeout/lost)
+  int defenseMissilesActive;          // Currently in flight
+  
+  // Retry tracking
+  int totalRetryAttempts;             // Extra interceptors used
+  float retryPenaltyTotal;            // Total penalty from retries
+  
+  // Verification counters (should always balance)
+  int enemyMissilesAccountedFor;      // Should equal enemyMissilesLaunched
+  int defenseMissilesAccountedFor;    // Should equal defenseMissilesLaunched
+  
   // PhysX metrics
   float avgDragForce;
   float avgLiftForce;
@@ -467,6 +520,214 @@ struct TrainingMetrics {
   float totalSpeedBonus;
   float totalPredictionBonus;
   float totalPenalties;
+  
+  // Scoring
+  float efficiencyScore;              // Interceptions / Defense missiles used
+  float defenseScore;                 // Based on territory protection
+};
+
+// ============================================================================
+// DEFENSE-GRADE SIMULATION CONSTANTS (Research Implementation)
+// ============================================================================
+
+// 6-DOF Dynamics Constants
+#define SIXDOF_SUBSTEPS 8
+#define SIXDOF_DT 0.001f
+#define MAX_MANEUVER_G 40.0f
+#define MAX_AOA_RAD 0.5236f  // 30 degrees
+#define MAX_ROLL_RATE 6.0f   // rad/s
+
+// Earth and Gravity Constants
+#define EARTH_RADIUS 6371000.0f
+#define EARTH_MU 3.986004418e14
+#define EARTH_J2 1.08263e-3
+#define EARTH_OMEGA 7.2921159e-5
+
+// Reference Frames
+#define COORD_NED 0
+#define COORD_ECEF 1
+#define COORD_ECI 2
+
+// Aerodynamic Database Constants
+#define AERO_MACH_POINTS 20
+#define AERO_AOA_POINTS 30
+#define AERO_ALTITUDE_POINTS 15
+
+// Sensor Simulation Constants
+#define MAX_SCATTERERS 64
+#define RCS_WAVELENGTH 0.03f  // X-band radar (3cm)
+#define RADAR_PRF 1000.0f
+#define MICRO_DOPPLER_BINS 256
+#define MAX_TARGETS_TRACKED 200
+#define DISCRIMINATION_FEATURES 16
+
+// PhysNODE Constants
+#define PHYSNODE_SEQUENCE_LEN 20
+#define PHYSNODE_LATENT_DIM 32
+#define PHYSNODE_HIDDEN_DIM 64
+#define MC_DROPOUT_SAMPLES 10
+#define PHYSICS_LOSS_WEIGHT 10.0f
+
+// Hierarchical RL Constants
+#define STRATEGIST_STATE_DIM 64
+#define STRATEGIST_ACTION_DIM 8
+#define STRATEGIST_UPDATE_FREQ 10  // Hz
+#define PILOT_STATE_DIM 24
+#define PILOT_ACTION_DIM 4
+#define PILOT_UPDATE_FREQ 100  // Hz
+#define MPC_HORIZON 10
+#define MPC_ITERATIONS 5
+
+// Curriculum Learning Constants
+#define CURRICULUM_PHASES 5
+#define MIN_EPISODES_PER_PHASE 100
+#define ADVANCEMENT_THRESHOLD_BASIC 0.9f
+#define ADVANCEMENT_THRESHOLD_MANEUVER 0.8f
+#define ADVANCEMENT_THRESHOLD_MULTI 0.7f
+#define ADVANCEMENT_THRESHOLD_ADVERSARIAL 0.6f
+
+// Reward Shaping Constants
+#define REWARD_WARHEAD_INTERCEPT 200.0f
+#define REWARD_HGV_INTERCEPT 300.0f
+#define PENALTY_DECOY_INTERCEPT -100.0f
+#define REWARD_CORRECT_DISCRIMINATION 50.0f
+#define REWARD_INFORMATION_GAIN 10.0f
+#define PENALTY_MISSED_WARHEAD -500.0f
+
+// ============================================================================
+// ADVANCED SIMULATION STRUCTURES
+// ============================================================================
+
+// Quaternion structure for singularity-free rotation
+struct Quaternion {
+    float w, x, y, z;
+};
+
+
+// Mass and inertia properties (variable with fuel burn)
+struct MassInertiaProps {
+    float totalMass;
+    float dryMass;
+    float fuelMass;
+    float burnRate;
+    float3 inertiaMatrix;  // Ixx, Iyy, Izz (diagonal)
+    float3 cogOffset;      // Center of gravity offset from geometric center
+};
+
+// Aerodynamic coefficients lookup table
+struct AeroCoeffTable {
+    float machPoints[AERO_MACH_POINTS];
+    float aoaPoints[AERO_AOA_POINTS];
+    float cd[AERO_MACH_POINTS * AERO_AOA_POINTS];
+    float cl[AERO_MACH_POINTS * AERO_AOA_POINTS];
+    float cm[AERO_MACH_POINTS * AERO_AOA_POINTS];
+    int numMachPoints;
+    int numAoaPoints;
+};
+
+// Radar target signature for discrimination
+struct RadarSignature {
+    float rcsValues[8];           // RCS at different aspects
+    float microDoppler[MICRO_DOPPLER_BINS];
+    float ballisticCoeff;
+    float spinRate;
+    float length;
+    float precessionAngle;
+    int targetType;               // 0=warhead, 1=decoy, 2=debris, 3=HGV
+    float classificationConfidence;
+};
+
+// PhysNODE prediction state
+struct TrajectoryPrediction {
+    float3 predictedPositions[PREDICTION_STEPS];
+    float3 predictedVelocities[PREDICTION_STEPS];
+    float uncertaintyRadius[PREDICTION_STEPS];
+    float estimatedLD;            // Estimated Lift/Drag ratio
+    float estimatedBallCoeff;     // Estimated ballistic coefficient
+    float estimatedBankAngle;     // For HGV glide prediction
+    float confidence;
+    int numValidSteps;
+};
+
+// Hierarchical RL state
+struct HRLState {
+    // Strategist level
+    int currentStrategy;          // Assigned strategy ID
+    float strategyConfidence;
+    float resourceAllocation[10]; // Interceptor allocation per threat
+    
+    // Pilot level
+    float3 guidanceCommand;       // Body-frame acceleration command
+    float commandMagnitude;
+    float timeToGo;
+    float zeroEffortMiss;
+    
+    // Hybrid RL-MPC state
+    float mpcAccelCmd[MPC_HORIZON * 3];
+    float mpcCost;
+    int mpcConverged;
+};
+
+// Extended Missile state with defense-grade features
+struct MassProperties {
+    float mass;              // Current mass (kg)
+    float initialMass;       // Mass at launch
+    float propellantMass;    // Remaining propellant
+    float burnRate;          // kg/s
+    float3 centerOfMass;     // CoM offset from geometric center (body frame)
+    float Ixx, Iyy, Izz;     // Principal moments of inertia
+    float Ixy, Ixz, Iyz;     // Products of inertia (usually small for missiles)
+};
+
+struct State6DOF {
+    float3 position;
+    float3 velocity;
+    Quaternion attitude;
+    float3 angularVelocity;
+    MassProperties massProps;
+    
+    float altitude;
+    float machNumber;
+    float dynamicPressure;
+    float angleOfAttack;
+    float sideslipAngle;
+    float3 velocity_body;
+    float3 acceleration;
+};
+
+struct MissileExtended {
+    // Core state
+    State6DOF state;
+    MassInertiaProps massProps;
+    
+    // Signature
+    RadarSignature signature;
+    
+    // Prediction
+    TrajectoryPrediction prediction;
+    
+    // Guidance
+    HRLState hrlState;
+    
+    // Original ID for linking
+    int baseMissileId;
+};
+
+// Training state for curriculum learning
+struct CurriculumTrainingState {
+    int currentPhase;
+    int episodesInPhase;
+    float phaseSuccessRate;
+    float difficultyMultiplier;
+    
+    // Phase-specific metrics
+    float avgInterceptTime;
+    float avgPredictionError;
+    float avgDiscriminationAccuracy;
+    
+    // Best performance tracking
+    float bestSuccessRatePerPhase[CURRICULUM_PHASES];
+    int episodesPerPhase[CURRICULUM_PHASES];
 };
 
 #endif // CONFIG_H
